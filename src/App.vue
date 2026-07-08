@@ -110,7 +110,6 @@
         :class="['pill', 'volume-pill', volumeMuted ? 'muted' : '']"
         @click="onToggleMute"
         @wheel.prevent="onVolumeWheel"
-        @contextmenu.prevent="onVolumeRight"
         title="左键静音 / 滚轮调节"
       >
         <span class="nf-icon">{{ volumeIconChar }}</span> {{ volumeLabel }}
@@ -438,14 +437,6 @@ async function onVolumeWheel(e: WheelEvent) {
     await invoke('adjust_volume', { delta });
   } catch (err) {
     console.error('adjust_volume error:', err);
-  }
-}
-
-async function onVolumeRight() {
-  try {
-    await invoke('adjust_volume', { delta: -5 });
-  } catch (e) {
-    console.error('adjust_volume error:', e);
   }
 }
 
