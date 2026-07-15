@@ -271,7 +271,7 @@ onMounted(() => {
 
   (async () => {
     try {
-      unlistenMon = await listen<MonitorInfoSnapshot>('monitor-update', (event) => {
+      unlistenMon = await listen<MonitorInfoSnapshot | null>('monitor-update', (event) => {
         monitorSnapshot.value = event.payload;
       });
       unlistenSys = await listen<SystemSnapshot>('system-update', (event) => {
@@ -283,8 +283,9 @@ onMounted(() => {
       unlistenBri = await listen<BrightnessSnapshot>('brightness-update', (event) => {
         brightnessSnapshot.value = event.payload;
       });
+      await invoke<void>('frontend_ready');
     } catch (e) {
-      console.error('Failed to register Tauri event listeners:', e);
+      console.error('Failed to initialize Tauri event bridge:', e);
     }
   })();
 

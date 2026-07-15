@@ -16,11 +16,6 @@ tauri-build = { version = "2.6.3", features = [] }
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-opener = "2.5.4"
 
-bincode = "2.0.1"
-chrono = "0.4.45"
 log = "0.4.32"
-tokio = { version = "1.52.3", features = ["full"] }
-shared_structures = { git = "https://github.com/beamiter/shared_structures.git", features = ["use-futex"] }
-xbar_core = { git = "https://github.com/beamiter/xbar_core.git" }
-serde_json = "1.0.150"
+xbar_core = { git = "https://github.com/beamiter/xbar_core.git", default-features = false, features = ["logging-flexi", "provider-alsa", "provider-battery-sysfs", "provider-brightnessctl", "provider-system", "transport-shared"] }
 serde = { version = "1.0.228", features = ["derive"] }
