@@ -22,7 +22,7 @@
       <div class="layout-controls">
         <div
           :class="['pill', 'layout-toggle', layoutOpen ? 'open' : 'closed']"
-          @click="layoutOpen = !layoutOpen"
+          @click="onLayoutToggle"
           title="切换布局"
         >
           {{ currentSymbol }}
@@ -71,12 +71,10 @@
           <div
             class="pill usage-pill"
             :class="battClass"
-            :title="systemSnapshot.is_charging
-              ? `电池充电中: ${systemSnapshot.battery_percent.toFixed(1)}%`
-              : `电池电量: ${systemSnapshot.battery_percent.toFixed(1)}%`"
+            :title="batteryTitle"
           >
-            <span class="nf-icon">{{ systemSnapshot.is_charging ? ICON_BAT_CHG : ICON_BAT_FULL }}</span>
-            {{ Math.round(systemSnapshot.battery_percent) }}%
+            <span class="nf-icon">{{ batteryCharging ? ICON_BAT_CHG : ICON_BAT_FULL }}</span>
+            {{ batteryLabel }}
           </div>
         </div>
       </template>
@@ -128,8 +126,8 @@
       <!-- 时间 -->
       <div
         class="pill time-pill"
-        @click="showSeconds = !showSeconds"
-        title="点击切换秒显示"
+        @click="onToggleSeconds"
+        :title="showSeconds ? '点击隐藏秒' : '点击显示秒'"
       >
         <span class="nf-icon">{{ ICON_TIME }}</span> {{ formattedTime }}
       </div>
@@ -146,48 +144,71 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
-// --- 类型定义，与后端 Rust 结构体对应 ---
-interface TagStatus {
-  is_selected: boolean;
-  is_urg: boolean;
-  is_filled: boolean;
-  is_occ: boolean;
+interface TagState {
+  selected: boolean;
+  urgent: boolean;
+  filled: boolean;
+  occupied: boolean;
 }
 
-interface MonitorInfoSnapshot {
-  monitor_num: number;
-  monitor_width: number;
-  monitor_height: number;
-  monitor_x: number;
-  monitor_y: number;
-  tag_status_vec: TagStatus[];
-  client_name: string;
-  ltsymbol: string;
+interface AudioDeviceInfo {
+  name: string;
+  volume: number;
+  is_muted: boolean;
 }
 
-interface SystemSnapshot {
+interface SystemDetails {
   cpu_average: number;
   memory_used: number;
   memory_total: number;
   memory_usage_percent: number;
-  battery_percent: number;
-  is_charging: boolean;
 }
 
-interface AudioSnapshot {
-  volume: number;
-  is_muted: boolean;
-  device_name: string;
-  has_device: boolean;
-}
-
-interface BrightnessSnapshot {
+interface BatteryState {
   percent: number | null;
+  charging: boolean;
+  present: boolean;
 }
+
+interface BarSnapshot {
+  wm_available: boolean;
+  tags: TagState[];
+  monitor: number;
+  layout_symbol: string;
+  client_name: string;
+  time: string;
+  show_seconds: boolean;
+  layout_selector_open: boolean;
+  audio_device: AudioDeviceInfo | null;
+  system_details: SystemDetails;
+  brightness: { percent: number | null };
+  battery: BatteryState;
+}
+
+interface FrontendEnvelope {
+  revision: number;
+  changes: number;
+  snapshot: BarSnapshot;
+  partition_changes?: number;
+}
+
+type ActionRequest =
+  | { action: 'view_tag_on'; tag_index: number; monitor_id: number }
+  | { action: 'toggle_layout_selector' }
+  | { action: 'set_layout_on'; layout_id: number; monitor_id: number }
+  | { action: 'toggle_seconds' }
+  | { action: 'toggle_mute' }
+  | { action: 'adjust_volume'; delta: number }
+  | { action: 'adjust_brightness'; delta: number }
+  | { action: 'screenshot' };
+
+const dispatchAction = (request: ActionRequest): Promise<void> =>
+  invoke('dispatch_action', { request });
 
 // --- Nerd Font 图标 ---
 const TAG_ICONS = [
@@ -216,30 +237,24 @@ const ICON_TIME = '\u{F0954}';
 const ICON_MON = '\u{F0379}';
 
 // --- 帮助函数 ---
-const getButtonClass = (tagStatus: TagStatus): string => {
-  if (tagStatus.is_filled) return 'emoji-button state-filtered';
-  if (tagStatus.is_selected) return 'emoji-button state-selected';
-  if (tagStatus.is_urg) return 'emoji-button state-urgent';
-  if (tagStatus.is_occ) return 'emoji-button state-occupied';
+const getButtonClass = (tag: TagState): string => {
+  if (tag.filled) return 'emoji-button state-filtered';
+  if (tag.selected) return 'emoji-button state-selected';
+  if (tag.urgent) return 'emoji-button state-urgent';
+  if (tag.occupied) return 'emoji-button state-occupied';
   return 'emoji-button state-default';
 };
 
 const formatBytes = (bytes: number): string => {
   if (bytes === 0) return '0B';
-  const UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  const size = parseFloat((bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1));
-  return `${size}${UNITS[i]}`;
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const index = Math.min(
+    units.length - 1,
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+  );
+  const size = Number((bytes / Math.pow(1024, index)).toFixed(index === 0 ? 0 : 1));
+  return `${size}${units[index]}`;
 };
-
-function parseLtSymbol(lts?: string) {
-  if (!lts) return { symbol: '[]=', scale: undefined as number | undefined };
-  const symbolMatch = lts.match(/^(\S+)/);
-  const scaleMatch = lts.match(/s:\s*([0-9.]+)/i);
-  const symbol = symbolMatch ? symbolMatch[1] : '[]=';
-  const scale = scaleMatch ? parseFloat(scaleMatch[1]) : undefined;
-  return { symbol, scale };
-}
 
 function monitorIcon(num: number) {
   if (num === 0) return '\u{F02DA}';
@@ -248,80 +263,58 @@ function monitorIcon(num: number) {
 }
 
 // --- 响应式状态 ---
-const monitorSnapshot = ref<MonitorInfoSnapshot | null>(null);
-const systemSnapshot = ref<SystemSnapshot | null>(null);
-const audioSnapshot = ref<AudioSnapshot | null>(null);
-const brightnessSnapshot = ref<BrightnessSnapshot | null>(null);
-
+const snapshot = ref<BarSnapshot | null>(null);
+const scaleFactor = ref<number | null>(null);
 const pressedButton = ref<number | null>(null);
-const layoutOpen = ref(false);
 const isTaking = ref(false);
 
-const showSeconds = ref(true);
-const now = ref(new Date());
-let timer: number | undefined;
+let cancelled = false;
+let revision: number | null = null;
+let unlisten: UnlistenFn | undefined;
 
 // --- 事件监听（Tauri） ---
 onMounted(() => {
-  console.log('Tauri Vue frontend has loaded.');
-  let unlistenMon: UnlistenFn | null = null;
-  let unlistenSys: UnlistenFn | null = null;
-  let unlistenAud: UnlistenFn | null = null;
-  let unlistenBri: UnlistenFn | null = null;
-
   (async () => {
-    try {
-      unlistenMon = await listen<MonitorInfoSnapshot | null>('monitor-update', (event) => {
-        monitorSnapshot.value = event.payload;
-      });
-      unlistenSys = await listen<SystemSnapshot>('system-update', (event) => {
-        systemSnapshot.value = event.payload;
-      });
-      unlistenAud = await listen<AudioSnapshot>('audio-update', (event) => {
-        audioSnapshot.value = event.payload;
-      });
-      unlistenBri = await listen<BrightnessSnapshot>('brightness-update', (event) => {
-        brightnessSnapshot.value = event.payload;
-      });
-      await invoke<void>('frontend_ready');
-    } catch (e) {
-      console.error('Failed to initialize Tauri event bridge:', e);
+    const stopListening = await listen<FrontendEnvelope>('xbar-state', (event) => {
+      if (cancelled) return;
+      if (revision !== null && event.payload.revision < revision) return;
+      revision = event.payload.revision;
+      snapshot.value = event.payload.snapshot;
+    });
+    if (cancelled) {
+      stopListening();
+      return;
     }
-  })();
+    unlisten = stopListening;
 
-  startTimer();
-
-  onBeforeUnmount(() => {
-    if (unlistenMon) unlistenMon();
-    if (unlistenSys) unlistenSys();
-    if (unlistenAud) unlistenAud();
-    if (unlistenBri) unlistenBri();
-    if (timer) clearInterval(timer);
+    try {
+      scaleFactor.value = await getCurrentWindow().scaleFactor();
+    } catch (error) {
+      console.error('Failed to query the Tauri window scale factor:', error);
+    }
+    await invoke<void>('frontend_ready');
+  })().catch((error) => {
+    console.error('Failed to initialize xbar Tauri bridge:', error);
   });
 });
 
-watch(showSeconds, () => startTimer());
-
-function startTimer() {
-  if (timer) clearInterval(timer);
-  timer = window.setInterval(() => {
-    now.value = new Date();
-  }, showSeconds.value ? 1000 : 60000);
-}
+onBeforeUnmount(() => {
+  cancelled = true;
+  unlisten?.();
+});
 
 // --- 计算属性 ---
-const monitorNum = computed(() => monitorSnapshot.value?.monitor_num ?? 0);
-
-const currentSymbol = computed(() => {
-  const lts = monitorSnapshot.value?.ltsymbol;
-  return parseLtSymbol(lts).symbol;
-});
-
-const scaleText = computed(() => {
-  const lts = monitorSnapshot.value?.ltsymbol;
-  const { scale } = parseLtSymbol(lts);
-  return scale !== undefined ? scale.toFixed(2) : '--';
-});
+const monitorSnapshot = computed(() => snapshot.value);
+const systemSnapshot = computed(() => snapshot.value?.system_details ?? null);
+const audioSnapshot = computed(() => snapshot.value?.audio_device ?? null);
+const monitorNum = computed(() => snapshot.value?.monitor ?? 0);
+const currentSymbol = computed(() => snapshot.value?.layout_symbol || '[]=');
+const layoutOpen = computed(() => snapshot.value?.layout_selector_open ?? false);
+const showSeconds = computed(() => snapshot.value?.show_seconds ?? true);
+const formattedTime = computed(() => snapshot.value?.time || '--');
+const scaleText = computed(() =>
+  scaleFactor.value === null ? '--' : scaleFactor.value.toFixed(2),
+);
 
 const cpuClass = computed(() => {
   if (!systemSnapshot.value) return 'usage-warn';
@@ -335,20 +328,40 @@ const memClass = computed(() => {
   return p <= 30 ? 'usage-good' : p <= 60 ? 'usage-warn' : p <= 80 ? 'usage-caution' : 'usage-danger';
 });
 
+const batteryPercent = computed(() => {
+  const battery = snapshot.value?.battery;
+  return battery?.present ? battery.percent : null;
+});
+
 const battClass = computed(() => {
-  if (!systemSnapshot.value) return 'usage-warn';
-  const p = systemSnapshot.value.battery_percent;
-  return p > 50 ? 'usage-good' : p > 20 ? 'usage-warn' : 'usage-danger';
+  const percent = batteryPercent.value;
+  if (percent === null) return 'usage-warn';
+  return percent > 50 ? 'usage-good' : percent > 20 ? 'usage-warn' : 'usage-danger';
+});
+
+const batteryCharging = computed(() => snapshot.value?.battery.charging ?? false);
+
+const batteryTitle = computed(() => {
+  const percent = batteryPercent.value;
+  if (percent === null) return '未检测到电池';
+  return batteryCharging.value
+    ? `电池充电中: ${percent.toFixed(1)}%`
+    : `电池电量: ${percent.toFixed(1)}%`;
+});
+
+const batteryLabel = computed(() => {
+  const percent = batteryPercent.value;
+  return percent === null ? '--' : `${percent.toFixed(0)}%`;
 });
 
 const volumeMuted = computed(() => {
   const s = audioSnapshot.value;
-  return !s || s.is_muted || !s.has_device;
+  return !s || s.is_muted;
 });
 
 const volumeIconChar = computed(() => {
   const s = audioSnapshot.value;
-  if (!s || !s.has_device) return ICON_VOL_MUTE;
+  if (!s) return ICON_VOL_MUTE;
   if (s.is_muted) return ICON_VOL_MUTE;
   if (s.volume <= 0) return ICON_VOL_MUTE;
   if (s.volume < 34) return ICON_VOL_LOW;
@@ -358,31 +371,24 @@ const volumeIconChar = computed(() => {
 
 const volumeLabel = computed(() => {
   const s = audioSnapshot.value;
-  if (!s || !s.has_device) return '--';
+  if (!s) return '--';
   return `${s.volume}%`;
 });
 
 const brightnessLabel = computed(() => {
-  const p = brightnessSnapshot.value?.percent;
-  return typeof p === 'number' ? `${p}%` : '--';
-});
-
-function pad(n: number) {
-  return n.toString().padStart(2, '0');
-}
-
-const formattedTime = computed(() => {
-  const d = now.value;
-  const ts = `${pad(d.getHours())}:${pad(d.getMinutes())}${showSeconds.value ? `:${pad(d.getSeconds())}` : ''}`;
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${ts}`;
+  const percent = snapshot.value?.brightness.percent;
+  return typeof percent === 'number' ? `${percent.toFixed(0)}%` : '--';
 });
 
 // --- 事件处理 ---
 function buttonClass(i: number) {
-  const tagStatus =
-    monitorSnapshot.value?.tag_status_vec?.[i] ??
-    ({ is_selected: false, is_urg: false, is_filled: false, is_occ: false } as TagStatus);
-  const baseClass = getButtonClass(tagStatus);
+  const tag = snapshot.value?.tags[i] ?? {
+    selected: false,
+    urgent: false,
+    filled: false,
+    occupied: false,
+  };
+  const baseClass = getButtonClass(tag);
   const isPressed = pressedButton.value === i;
   return isPressed ? `${baseClass} pressed` : baseClass;
 }
@@ -390,25 +396,33 @@ function buttonClass(i: number) {
 async function onTagRelease(index: number) {
   pressedButton.value = null;
   try {
-    await invoke('send_tag_command', {
-      tagIndex: index,
-      isView: true,
-      monitorId: monitorNum.value,
+    await dispatchAction({
+      action: 'view_tag_on',
+      tag_index: index,
+      monitor_id: monitorNum.value,
     });
-  } catch (e) {
-    console.error('send_tag_command error:', e);
+  } catch (error) {
+    console.error('view_tag_on error:', error);
   }
 }
 
-async function onLayoutSelect(idx: number) {
-  layoutOpen.value = false;
+async function onLayoutToggle() {
   try {
-    await invoke('send_layout_command', {
-      layoutIndex: idx,
-      monitorId: monitorNum.value,
+    await dispatchAction({ action: 'toggle_layout_selector' });
+  } catch (error) {
+    console.error('toggle_layout_selector error:', error);
+  }
+}
+
+async function onLayoutSelect(layoutId: number) {
+  try {
+    await dispatchAction({
+      action: 'set_layout_on',
+      layout_id: layoutId,
+      monitor_id: monitorNum.value,
     });
-  } catch (e) {
-    console.error('send_layout_command error:', e);
+  } catch (error) {
+    console.error('set_layout_on error:', error);
   }
 }
 
@@ -416,53 +430,61 @@ async function onScreenshot() {
   if (isTaking.value) return;
   isTaking.value = true;
   try {
-    await invoke('take_screenshot');
-  } catch (e) {
-    console.error('take_screenshot error:', e);
+    await dispatchAction({ action: 'screenshot' });
+  } catch (error) {
+    console.error('screenshot error:', error);
   } finally {
-    setTimeout(() => (isTaking.value = false), 500);
+    window.setTimeout(() => (isTaking.value = false), 500);
   }
 }
 
 async function onToggleMute() {
   try {
-    await invoke('toggle_mute');
-  } catch (e) {
-    console.error('toggle_mute error:', e);
+    await dispatchAction({ action: 'toggle_mute' });
+  } catch (error) {
+    console.error('toggle_mute error:', error);
   }
 }
 
 async function onVolumeWheel(e: WheelEvent) {
   const delta = e.deltaY < 0 ? 5 : -5;
   try {
-    await invoke('adjust_volume', { delta });
-  } catch (err) {
-    console.error('adjust_volume error:', err);
+    await dispatchAction({ action: 'adjust_volume', delta });
+  } catch (error) {
+    console.error('adjust_volume error:', error);
   }
 }
 
 async function onBrightnessClick() {
   try {
-    await invoke('adjust_brightness', { delta: 5 });
-  } catch (e) {
-    console.error('adjust_brightness error:', e);
+    await dispatchAction({ action: 'adjust_brightness', delta: 5 });
+  } catch (error) {
+    console.error('adjust_brightness error:', error);
   }
 }
 
 async function onBrightnessRight() {
   try {
-    await invoke('adjust_brightness', { delta: -5 });
-  } catch (e) {
-    console.error('adjust_brightness error:', e);
+    await dispatchAction({ action: 'adjust_brightness', delta: -5 });
+  } catch (error) {
+    console.error('adjust_brightness error:', error);
   }
 }
 
 async function onBrightnessWheel(e: WheelEvent) {
   const delta = e.deltaY < 0 ? 5 : -5;
   try {
-    await invoke('adjust_brightness', { delta });
-  } catch (err) {
-    console.error('adjust_brightness error:', err);
+    await dispatchAction({ action: 'adjust_brightness', delta });
+  } catch (error) {
+    console.error('adjust_brightness error:', error);
+  }
+}
+
+async function onToggleSeconds() {
+  try {
+    await dispatchAction({ action: 'toggle_seconds' });
+  } catch (error) {
+    console.error('toggle_seconds error:', error);
   }
 }
 </script>
